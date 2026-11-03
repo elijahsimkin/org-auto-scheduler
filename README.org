@@ -804,10 +804,18 @@ When the scheduler runs, all title markers are parsed, their corresponding prope
 When you add a *newly added task* (an =AUTOSCH= task that is unscheduled or scheduled date-only today without a time):
 - *High-Priority Displacement:* If the new task has a higher priority or score than upcoming tasks, it automatically takes the upcoming slot and moves upcoming unpinned tasks forward.
 - *Strict Protection for Lapsed & Current Work:*
-  - *Lapsed tasks* (tasks that started earlier today in the past) are *never moved automatically*.
+  - *Lapsed tasks* (tasks that started earlier today in the past) are *never moved automatically* (unless =org-auto-scheduler-preserve-today-mode= is ='clocked-only=; see below).
   - *Current tasks* (tasks currently in progress or actively clocked in) are *never moved automatically*.
   - *Pinned tasks* (tasks with =:PINNED: t= or =:PINNED_TIME:=) are *never moved automatically*.
 - *Zero Churn on Idle Runs:* If no unscheduled tasks exist (and no =-r-= marker is present), upcoming unpinned tasks remain locked in place across background idle syncs.
+
+*** Clocked-Only Preservation
+<<clocked-only-preservation>>
+
+Set =org-auto-scheduler-preserve-today-mode= to ='clocked-only= to keep only the clocked-in task and pinned tasks in place, and keep the rest of today in priority order:
+- *Lapsed tasks are replanned in the background:* once a task's start is more than =org-auto-scheduler-lapse-grace-minutes= (default 10) in the past and it isn't clocked, done or pinned, background runs place it again by score, so a lapsed =[#A]= task goes ahead of upcoming =[#C]= tasks.
+- *Score changes reorder the day:* when a task's score changes between runs (priority, effort, deadline, state), today's upcoming unpinned tasks are replanned by score.
+- *Still no idle churn:* if nothing has lapsed and no score has changed, slots stay put. Deadline urgency counts whole days, so scores don't change as the day goes on.
 
 *** Background Run Change Logging
 <<background-run-change-logging>>
