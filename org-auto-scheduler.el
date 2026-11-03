@@ -711,10 +711,36 @@ title marker (such as -r- or -r-all-) or `force-replan'."
   "When non-nil, manual runs reschedule uncompleted tasks whose slot has elapsed.
 This also covers the currently clocked task (scheduled for its remaining effort,
 starting after the running clock) and pinned tasks (their pinned time is moved
-to the new slot).  Background runs never do this automatically; they only
+to the new slot).  Background runs don't do this unless
+`org-auto-scheduler-preserve-today-mode' is `clocked-only'; otherwise they only
 replan today's upcoming tasks when a new overlap or unscheduled task appears."
   :type 'boolean
   :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-preserve-today-mode 'all
+  "Which of today's scheduled tasks scheduling runs keep in place.
+`all'          Keep every task already scheduled today, except what
+               `org-auto-scheduler-manual-reschedule-lapsed' replans on
+               manual runs (default, previous behavior).
+`clocked-only' Keep only the clocked-in task and pinned tasks.  Background
+               runs also replan lapsed tasks (once their start is more than
+               `org-auto-scheduler-lapse-grace-minutes' ago), and any run
+               replans today's upcoming tasks when a task's score changed
+               since the previous run.  Otherwise slots stay put, so idle
+               runs don't make tasks slide forward."
+  :type '(choice (const :tag "Keep all of today's slots" all)
+                 (const :tag "Keep only clocked and pinned tasks" clocked-only))
+  :group 'org-auto-scheduler)
+
+(defcustom org-auto-scheduler-lapse-grace-minutes 10
+  "Minutes after a task's start before background runs treat it as lapsed.
+Only used when `org-auto-scheduler-preserve-today-mode' is `clocked-only'."
+  :type 'integer
+  :group 'org-auto-scheduler)
+
+(defvar org-auto-scheduler--last-task-scores nil
+  "Hash table of task ID -> score from the previous non-preview scheduling run.
+Used by `clocked-only' preserve mode to replan only when a score changed.")
 
 (defcustom org-auto-scheduler-title-marker-regex
   (let ((token "\\(?:r-all\\|done\\|kill\\|drop\\|defer\\|pri-none\\|\\+[0-9]+d\\|w\\+[0-9]+[dwmy]\\|wait\\+[0-9]+[dwmy]\\|wait\\|e[0-9]+[hm0-9:]*\\|#[a-zA-Z]\\|pri-?[a-zA-Z]\\|![a-zA-Z]\\|\\\\indep\\|indep\\|\\\\[sfpi#!]\\|[rsfpxciwRSFPXCIW]\\)"))
@@ -1297,6 +1323,42 @@ Checks for what-if overrides in the review buffer if active."
          (scheduler-end-minutes (org-duration-to-minutes org-auto-scheduler-end-time)))
     (and (>= start-minutes scheduler-start-minutes)
          (<= end-minutes scheduler-end-minutes))))
+
+(defun org-auto-scheduler--get-lapsed-kind (marker task-id start-time now replan-lapsed background-replan-lapsed)
+  "Return \='clocked, \='lapsed or nil for the task at MARKER starting at START-TIME.
+REPLAN-LAPSED (manual runs) replans the clocked task and any task that started
+before NOW.  BACKGROUND-REPLAN-LAPSED only replans unclocked, unpinned tasks
+that started more than `org-auto-scheduler-lapse-grace-minutes' before NOW."
+  (let* ((is-clocked (org-auto-scheduler--task-clocked-p marker))
+         (grace-seconds (* 60 org-auto-scheduler-lapse-grace-minutes))
+         (is-past-grace (time-less-p (time-add start-time grace-seconds) now)))
+    (cond
+     (replan-lapsed
+      (cond (is-clocked 'clocked)
+            ((time-less-p start-time now) 'lapsed)))
+     (background-replan-lapsed
+      (when (and (not is-clocked)
+                 is-past-grace
+                 (not (org-auto-scheduler-task-pinned-p marker task-id)))
+        'lapsed)))))
+
+(defun org-auto-scheduler--task-scores-changed-p (sorted-tasks-info)
+  "Return non-nil if a task in SORTED-TASKS-INFO changed score since the last run.
+Tasks new since the last run don't count; the first run never counts."
+  (let ((score-tolerance 0.001))
+    (and (hash-table-p org-auto-scheduler--last-task-scores)
+         (cl-some (lambda (task-info)
+                    (let ((last-score (gethash (nth 5 task-info) org-auto-scheduler--last-task-scores)))
+                      (and last-score
+                           (> (abs (- (nth 1 task-info) last-score)) score-tolerance))))
+                  sorted-tasks-info))))
+
+(defun org-auto-scheduler--record-task-scores (sorted-tasks-info)
+  "Remember each task's score in SORTED-TASKS-INFO for the next run."
+  (let ((task-id-to-score (make-hash-table :test 'equal)))
+    (dolist (task-info sorted-tasks-info)
+      (puthash (nth 5 task-info) (nth 1 task-info) task-id-to-score))
+    (setq org-auto-scheduler--last-task-scores task-id-to-score)))
 
 (defun org-auto-scheduler--task-clocked-p (marker)
   "Return non-nil if the task at MARKER is currently clocked in."
@@ -2807,10 +2869,19 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                  (today-scheduled '()) ; list of entries for today
                  (tasks-to-schedule '()) ; tasks that need scheduling slots
                  ;; Manual runs (not the background daemon) replan lapsed/clocked tasks
+                 (is-background-run (memq org-auto-scheduler--current-run-type
+                                          '(background-async background-sync)))
+                 (is-clocked-only-mode (eq org-auto-scheduler-preserve-today-mode 'clocked-only))
                  (replan-lapsed (and org-auto-scheduler-manual-reschedule-lapsed
-                                     (not (memq org-auto-scheduler--current-run-type
-                                                '(background-async background-sync)))))
+                                     (not is-background-run)))
+                 (background-replan-lapsed (and is-clocked-only-mode is-background-run))
+                 (has-score-change (and is-clocked-only-mode
+                                        preserve-today
+                                        (org-auto-scheduler--task-scores-changed-p sorted-tasks-info)))
                  (lapsed-ids (make-hash-table :test 'equal))) ; task-id -> 'clocked / 'lapsed
+
+            (unless org-auto-scheduler--preview-mode
+              (org-auto-scheduler--record-task-scores sorted-tasks-info))
 
             ;; Also capture any done/killed tasks into initial-snapshot so change logging can track them
             (maphash
@@ -2871,9 +2942,10 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                                         (if org-auto-scheduler-preserve-future-scheduled
                                             (org-auto-scheduler--task-scheduled-time marker today-str)
                                           (org-auto-scheduler--task-scheduled-today-p marker today-str))))
-                         (lapsed-kind (and sched-times replan-lapsed
-                                           (cond ((org-auto-scheduler--task-clocked-p marker) 'clocked)
-                                                 ((time-less-p (car sched-times) now) 'lapsed))))
+                         (lapsed-kind (and sched-times
+                                           (org-auto-scheduler--get-lapsed-kind
+                                            marker task-id (car sched-times) now
+                                            replan-lapsed background-replan-lapsed)))
                          (_ (when lapsed-kind (puthash task-id lapsed-kind lapsed-ids))))
                     (if (and sched-times (not lapsed-kind))
                         (let* ((start-t (car sched-times))
@@ -2955,7 +3027,8 @@ scratch, ignoring `org-auto-scheduler-preserve-today-scheduled'."
                     (> (hash-table-count lapsed-ids) 0))
                    (has-priority-reorder (or has-priority-or-indep-trigger
                                              has-unscheduled
-                                             has-lapsed))
+                                             has-lapsed
+                                             has-score-change))
                    (preserved-entries '())
                    (final-schedule-list '()))
 
